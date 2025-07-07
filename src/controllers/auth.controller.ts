@@ -1,0 +1,218 @@
+import { Request, Response } from 'express';
+import fetch from 'node-fetch';
+import { RegisterSchema, LoginSchema } from '../validators/auth.schema';
+import { z } from 'zod';
+import { getEnv } from '../utils/env';
+
+let mgmtToken: string | null = null;
+
+// Utility: Get Management API Token
+const getMgmtToken = async (): Promise<string> => {
+  const domain = getEnv('AUTH0_DOMAIN');
+  const clientId = getEnv('AUTH0_MGMT_CLIENT_ID');
+  const clientSecret = getEnv('AUTH0_MGMT_CLIENT_SECRET');
+
+  if (mgmtToken !== null) return mgmtToken;
+
+  const res = await fetch(`https://${domain}/oauth/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
+      audience: `https://${domain}/api/v2/`
+    })
+  });
+
+  const data = await res.json() as { access_token?: string };
+
+  if (!data.access_token) {
+    throw new Error(`Failed to fetch Auth0 Management API token: ${JSON.stringify(data)}`);
+  }
+
+  mgmtToken = data.access_token;
+  return mgmtToken;
+};
+
+// Utility: Get user's organization ID by email
+const getUserOrganizationId = async (email: string): Promise<string> => {
+  const domain = getEnv('AUTH0_DOMAIN');
+  const token = await getMgmtToken();
+
+  const userRes = await fetch(`https://${domain}/api/v2/users-by-email?email=${encodeURIComponent(email)}`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  const users = await userRes.json() as { user_id: string }[];
+  const user = users[0];
+
+  if (!user || !user.user_id) {
+    throw new Error('User not found');
+  }
+
+  const orgRes = await fetch(`https://${domain}/api/v2/users/${user.user_id}/organizations`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  const orgs = await orgRes.json() as { id: string }[];
+
+  if (!Array.isArray(orgs) || orgs.length === 0) {
+    throw new Error('User is not yet approved by an organization');
+  }
+
+  return orgs[0].id;
+};
+
+// POST /api/auth/register
+export const registerUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const body = RegisterSchema.parse(req.body);
+    const domain = getEnv('AUTH0_DOMAIN');
+    const token = await getMgmtToken();
+
+    const userRes = await fetch(`https://${domain}/api/v2/users`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        connection: 'Username-Password-Authentication',
+        email: body.email,
+        password: body.password,
+        username: body.username,
+        email_verified: false,
+        app_metadata: { approved: false }
+      })
+    });
+
+    const user = await userRes.json() as { user_id?: string };
+
+    if (!user.user_id) {
+      res.status(400).json({ error: 'User creation failed', detail: user });
+      return;
+    }
+
+    const orgRes = await fetch(`https://${domain}/api/v2/organizations/${body.organizationId}/members`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        members: [user.user_id]
+      })
+    });
+
+    if (!orgRes.ok) {
+      res.status(400).json({ error: 'Failed to add user to organization' });
+      return;
+    }
+
+    res.status(201).json({ message: 'Registration complete. Awaiting approval.' });
+  } catch (err: any) {
+    if (err instanceof z.ZodError) {
+      res.status(422).json({ errors: err.errors });
+    } else {
+      console.error('Register error:', err);
+      res.status(500).json({ error: 'Registration failed', detail: err.message });
+    }
+  }
+};
+
+// POST /api/auth/login
+export const loginUser = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const body = LoginSchema.parse(req.body);
+
+    const domain = getEnv('AUTH0_DOMAIN');
+    const clientId = getEnv('AUTH0_CLIENT_ID');
+    const clientSecret = getEnv('AUTH0_CLIENT_SECRET');
+
+    let orgId: string;
+    try {
+      orgId = await getUserOrganizationId(body.email);
+    } catch (orgErr: any) {
+      res.status(403).json({ error: 'User is pending organization approval' });
+      return;
+    }
+
+    const tokenRes = await fetch(`https://${domain}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'password',
+        username: body.email,
+        password: body.password,
+        client_id: clientId,
+        client_secret: clientSecret,
+        audience: `https://${domain}/api/v2/`,
+        scope: 'openid profile email',
+        realm: 'Username-Password-Authentication',
+        organization: orgId
+      })
+    });
+
+    const data = await tokenRes.json() as {
+      access_token?: string;
+      id_token?: string;
+      expires_in?: number;
+      token_type?: string;
+      error?: string;
+      error_description?: string;
+    };
+
+    if (data.error) {
+      res.status(401).json({ error: data.error_description });
+      return;
+    }
+
+    res.status(200).json({
+      access_token: data.access_token,
+      id_token: data.id_token,
+      expires_in: data.expires_in,
+      token_type: data.token_type
+    });
+  } catch (err: any) {
+    if (err instanceof z.ZodError) {
+      res.status(422).json({ errors: err.errors });
+    } else {
+      console.error('Login error:', err);
+      res.status(500).json({ error: 'Login failed', detail: err.message });
+    }
+  }
+};
+
+// GET /api/auth/organizations
+export const getOrganizations = async (_req: Request, res: Response): Promise<void> => {
+  try {
+    const token = await getMgmtToken();
+    const domain = getEnv('AUTH0_DOMAIN');
+
+    const orgRes = await fetch(`https://${domain}/api/v2/organizations`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    });
+
+    const orgs = await orgRes.json() as { id: string; name: string; display_name?: string }[];
+
+    if (!Array.isArray(orgs)) {
+      res.status(500).json({ error: 'Unexpected response from Auth0' });
+      return;
+    }
+
+    const filtered = orgs.map((org) => ({
+      id: org.id,
+      name: org.name,
+      display_name: org.display_name
+    }));
+
+    res.status(200).json(filtered);
+  } catch (err: any) {
+    console.error('Fetch orgs error:', err);
+    res.status(500).json({ error: 'Failed to fetch organizations', detail: err.message });
+  }
+};
