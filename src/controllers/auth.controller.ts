@@ -5,37 +5,48 @@ import { z } from 'zod';
 import { getEnv } from '../utils/env';
 
 let mgmtToken: string | null = null;
+let tokenExpiry: number | null = null;
 
-// Utility: Get Management API Token
 const getMgmtToken = async (): Promise<string> => {
+  const now = Date.now();
+  if (mgmtToken && tokenExpiry && now < tokenExpiry) return mgmtToken;
+
   const domain = getEnv('AUTH0_DOMAIN');
   const clientId = getEnv('AUTH0_MGMT_CLIENT_ID');
   const clientSecret = getEnv('AUTH0_MGMT_CLIENT_SECRET');
 
-  if (mgmtToken !== null) return mgmtToken;
+  try {
+    const res = await fetch(`https://${domain}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'client_credentials',
+        client_id: clientId,
+        client_secret: clientSecret,
+        audience: `https://${domain}/api/v2/`
+      })
+    });
 
-  const res = await fetch(`https://${domain}/oauth/token`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      grant_type: 'client_credentials',
-      client_id: clientId,
-      client_secret: clientSecret,
-      audience: `https://${domain}/api/v2/`
-    })
-  });
+    if (!res.ok) {
+      const errorText = await res.text();
+      throw new Error(`Failed to fetch token: ${errorText}`);
+    }
 
-  const data = await res.json() as { access_token?: string };
+    const data = await res.json() as { access_token?: string; expires_in?: number };
 
-  if (!data.access_token) {
-    throw new Error(`Failed to fetch Auth0 Management API token: ${JSON.stringify(data)}`);
+    if (!data.access_token || !data.expires_in) {
+      throw new Error(`Invalid token response: ${JSON.stringify(data)}`);
+    }
+
+    mgmtToken = data.access_token;
+    tokenExpiry = now + data.expires_in * 1000 - 60000; // buffer 1 minute
+    return mgmtToken;
+  } catch (err) {
+    console.error('getMgmtToken error:', err);
+    throw err;
   }
-
-  mgmtToken = data.access_token;
-  return mgmtToken;
 };
 
-// Utility: Get user's organization ID by email
 const getUserOrganizationId = async (email: string): Promise<string> => {
   const domain = getEnv('AUTH0_DOMAIN');
   const token = await getMgmtToken();
@@ -44,16 +55,26 @@ const getUserOrganizationId = async (email: string): Promise<string> => {
     headers: { Authorization: `Bearer ${token}` }
   });
 
+  if (!userRes.ok) {
+    const errorText = await userRes.text();
+    throw new Error(`Failed to fetch user by email: ${errorText}`);
+  }
+
   const users = await userRes.json() as { user_id: string }[];
   const user = users[0];
 
-  if (!user || !user.user_id) {
+  if (!user?.user_id) {
     throw new Error('User not found');
   }
 
   const orgRes = await fetch(`https://${domain}/api/v2/users/${user.user_id}/organizations`, {
     headers: { Authorization: `Bearer ${token}` }
   });
+
+  if (!orgRes.ok) {
+    const errorText = await orgRes.text();
+    throw new Error(`Failed to fetch user organizations: ${errorText}`);
+  }
 
   const orgs = await orgRes.json() as { id: string }[];
 
@@ -87,6 +108,12 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
       })
     });
 
+    if (!userRes.ok) {
+      const errorText = await userRes.text();
+      res.status(400).json({ error: 'User creation failed', detail: errorText });
+      return;
+    }
+
     const user = await userRes.json() as { user_id?: string };
 
     if (!user.user_id) {
@@ -106,7 +133,8 @@ export const registerUser = async (req: Request, res: Response): Promise<void> =
     });
 
     if (!orgRes.ok) {
-      res.status(400).json({ error: 'Failed to add user to organization' });
+      const errorText = await orgRes.text();
+      res.status(400).json({ error: 'Failed to add user to organization', detail: errorText });
       return;
     }
 
@@ -130,14 +158,6 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
     const clientId = getEnv('AUTH0_CLIENT_ID');
     const clientSecret = getEnv('AUTH0_CLIENT_SECRET');
 
-    let orgId: string;
-    try {
-      orgId = await getUserOrganizationId(body.email);
-    } catch (orgErr: any) {
-      res.status(403).json({ error: 'User is pending organization approval' });
-      return;
-    }
-
     const tokenRes = await fetch(`https://${domain}/oauth/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -149,10 +169,15 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
         client_secret: clientSecret,
         audience: `https://${domain}/api/v2/`,
         scope: 'openid profile email',
-        realm: 'Username-Password-Authentication',
-        organization: orgId
+        realm: 'Username-Password-Authentication'
       })
     });
+
+    if (!tokenRes.ok) {
+      const errorText = await tokenRes.text();
+      res.status(401).json({ error: 'Login failed', detail: errorText });
+      return;
+    }
 
     const data = await tokenRes.json() as {
       access_token?: string;
@@ -165,6 +190,35 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
 
     if (data.error) {
       res.status(401).json({ error: data.error_description });
+      return;
+    }
+
+    if (!data.access_token || !data.id_token) {
+      res.status(500).json({ error: 'Incomplete token response from Auth0' });
+      return;
+    }
+
+    try {
+      const { updateSession } = await import('../utils/sessionStore');
+      updateSession({
+        access_token: data.access_token,
+        id_token: data.id_token,
+        expires_in: data.expires_in,
+        token_type: data.token_type
+      });
+
+      const { decodeIdToken } = await import('../utils/decodeToken');
+      decodeIdToken();
+
+      const { fetchAndStoreOrgId } = await import('../utils/fetchOrgId');
+      await fetchAndStoreOrgId();
+    } catch (e) {
+      console.error('Session init error:', e);
+      if (e instanceof Error) {
+        res.status(500).json({ error: 'Login session setup failed', detail: e.message });
+      } else {
+        res.status(500).json({ error: 'Login session setup failed', detail: String(e) });
+      }
       return;
     }
 
@@ -196,6 +250,12 @@ export const getOrganizations = async (_req: Request, res: Response): Promise<vo
         Authorization: `Bearer ${token}`
       }
     });
+
+    if (!orgRes.ok) {
+      const errorText = await orgRes.text();
+      res.status(500).json({ error: 'Failed to fetch organizations', detail: errorText });
+      return;
+    }
 
     const orgs = await orgRes.json() as { id: string; name: string; display_name?: string }[];
 
