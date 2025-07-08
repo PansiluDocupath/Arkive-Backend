@@ -198,20 +198,24 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // Step 1: Save token to session
     try {
       const { updateSession } = await import('../utils/sessionStore');
-      updateSession({
+      await updateSession({
         access_token: data.access_token,
         id_token: data.id_token,
         expires_in: data.expires_in,
         token_type: data.token_type
       });
 
+      // Step 2: Decode and store email/nickname from token
       const { decodeIdToken } = await import('../utils/decodeToken');
-      decodeIdToken();
+      await decodeIdToken();
 
+      // Step 3: Fetch and store organization ID
       const { fetchAndStoreOrgId } = await import('../utils/fetchOrgId');
       await fetchAndStoreOrgId();
+
     } catch (e) {
       console.error('Session init error:', e);
       if (e instanceof Error) {
@@ -222,12 +226,14 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    // ✅ Login complete
     res.status(200).json({
       access_token: data.access_token,
       id_token: data.id_token,
       expires_in: data.expires_in,
       token_type: data.token_type
     });
+
   } catch (err: any) {
     if (err instanceof z.ZodError) {
       res.status(422).json({ errors: err.errors });
@@ -237,6 +243,7 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
     }
   }
 };
+
 
 // GET /api/auth/organizations
 export const getOrganizations = async (_req: Request, res: Response): Promise<void> => {
