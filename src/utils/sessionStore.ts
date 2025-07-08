@@ -8,6 +8,9 @@ export interface SessionData {
   id_token?: string;
   expires_in?: number;
   token_type?: string;
+  email?: string;
+  nickname?: string;
+  organization_id?: string;
   [key: string]: any;
 }
 
@@ -34,11 +37,26 @@ export const updateSession = async (updates: Partial<SessionData>): Promise<void
 export const getSession = async (): Promise<SessionData | null> => {
   try {
     await fs.access(SESSION_PATH);
+
     const content = await fs.readFile(SESSION_PATH, 'utf-8');
-    return JSON.parse(content);
+
+    if (!content.trim()) {
+      console.warn('Session file is empty. Returning null.');
+      return null;
+    }
+
+    try {
+      return JSON.parse(content);
+    } catch (parseErr) {
+      console.error('Corrupted session file. Deleting it.');
+      await fs.unlink(SESSION_PATH); // optional: clean up
+      return null;
+    }
+
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      return null; // File doesn't exist
+      console.warn('Session file does not exist.');
+      return null;
     }
     console.error('Error reading session:', err);
     throw new Error('Failed to read session');
@@ -53,6 +71,6 @@ export const clearSession = async (): Promise<void> => {
       console.error('Error clearing session:', err);
       throw new Error('Failed to clear session');
     }
-    // If ENOENT, do nothing — file doesn't exist
+    // File already deleted; no action needed
   }
 };
