@@ -3,6 +3,9 @@ import fetch from 'node-fetch';
 import { RegisterSchema, LoginSchema } from '../validators/auth.schema';
 import { z } from 'zod';
 import { getEnv } from '../utils/env';
+import { getOrCreateTenantDb } from '../database/tenantDbManager';
+import { ensureUserExists } from '../database/user/ensureUserExists';
+
 
 let mgmtToken: string | null = null;
 let tokenExpiry: number | null = null;
@@ -198,7 +201,7 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // Step 1: Save token to session
+    // Save token to session
     try {
       const { updateSession } = await import('../utils/sessionStore');
       await updateSession({
@@ -208,13 +211,45 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
         token_type: data.token_type
       });
 
-      // Step 2: Decode and store email/nickname from token
+      //Decode and store email/nickname from token
       const { decodeIdToken } = await import('../utils/decodeToken');
       await decodeIdToken();
 
-      // Step 3: Fetch and store organization ID
+      // Fetch and store organization ID
       const { fetchAndStoreOrgId } = await import('../utils/fetchOrgId');
       await fetchAndStoreOrgId();
+
+      // Create or connect to tenant-specific DB
+      try {
+        const fs = await import('fs/promises');
+        const path = await import('path');
+        const { getOrCreateTenantDb } = await import('../database/tenantDbManager');
+
+        
+
+        const sessionPath = path.resolve(process.cwd(), '.auth_session.json');
+        const sessionRaw = await fs.readFile(sessionPath, 'utf-8');
+        const session = JSON.parse(sessionRaw);
+
+        const orgId = session.organization_id;
+        if (!orgId) throw new Error('Organization ID missing in session file');
+
+        const tenantDb = await getOrCreateTenantDb(orgId);
+
+        
+        await ensureUserExists(tenantDb);
+
+        // add store tenantDb in a per-request store later
+
+      } catch (dbErr) {
+        console.error('Tenant DB setup error:', dbErr);
+        if (dbErr instanceof Error) {
+          res.status(500).json({ error: 'Tenant database setup failed', detail: dbErr.message });
+        } else {
+          res.status(500).json({ error: 'Tenant database setup failed', detail: String(dbErr) });
+        }
+        return;
+      }
 
     } catch (e) {
       console.error('Session init error:', e);
@@ -226,7 +261,7 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    // ✅ Login complete
+    // Login complete
     res.status(200).json({
       access_token: data.access_token,
       id_token: data.id_token,
@@ -243,6 +278,7 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
     }
   }
 };
+
 
 
 // GET /api/auth/organizations

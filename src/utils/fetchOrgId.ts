@@ -1,6 +1,7 @@
 import { getSession, updateSession } from './sessionStore';
 import { getEnv } from './env';
 import fetch from 'node-fetch';
+import { getMgmtApiToken } from './getMgmtToken'; 
 
 type Auth0User = {
   user_id: string;
@@ -21,13 +22,9 @@ export const fetchAndStoreOrgId = async (): Promise<void> => {
     }
 
     const domain = getEnv('AUTH0_DOMAIN');
-    const token = getEnv('MGMT_API_TOKEN');
+    const token = await getMgmtApiToken();
 
-    if (!token) {
-      throw new Error('Missing MGMT_API_TOKEN in environment');
-    }
-
-    // Get user by email
+    //Get user by email
     const userRes = await fetch(
       `https://${domain}/api/v2/users-by-email?email=${encodeURIComponent(session.email)}`,
       {
@@ -47,7 +44,7 @@ export const fetchAndStoreOrgId = async (): Promise<void> => {
       throw new Error('User not found or missing user_id');
     }
 
-    // Get user's organization
+    //Get user's organizations
     const orgRes = await fetch(
       `https://${domain}/api/v2/users/${user.user_id}/organizations`,
       {
@@ -67,7 +64,8 @@ export const fetchAndStoreOrgId = async (): Promise<void> => {
     }
 
     const orgId = orgs[0].id;
-    await updateSession({ organization_id: orgId });
+    await updateSession({ organization_id: orgId }); // save to session
+
   } catch (err) {
     console.error('Error in fetchAndStoreOrgId:', err);
     throw new Error('Failed to fetch and store organization ID');
