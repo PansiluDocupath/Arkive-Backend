@@ -157,6 +157,35 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
   try {
     const body = LoginSchema.parse(req.body);
 
+        // ---- Check if user is approved before login continues ----
+        const mgmtToken = await getMgmtToken();
+        const userInfoRes = await fetch(`https://${getEnv('AUTH0_DOMAIN')}/api/v2/users-by-email?email=${encodeURIComponent(body.email)}`, {
+          headers: {
+            Authorization: `Bearer ${mgmtToken}`
+          }
+        });
+    
+        if (!userInfoRes.ok) {
+          const errorText = await userInfoRes.text();
+          res.status(401).json({ error: 'Login failed', detail: errorText });
+          return;
+        }
+    
+        const userInfo = await userInfoRes.json() as { user_id: string; app_metadata?: { approved?: boolean } }[];
+        const user = userInfo[0];
+    
+        if (!user) {
+          res.status(401).json({ error: 'Login failed', detail: 'User not found' });
+          return;
+        }
+    
+        const isApproved = user.app_metadata?.approved;
+    
+        if (!isApproved) {
+          res.status(403).json({ error: 'waiting for approval' });
+          return;
+        }
+
     const domain = getEnv('AUTH0_DOMAIN');
     const clientId = getEnv('AUTH0_CLIENT_ID');
     const clientSecret = getEnv('AUTH0_CLIENT_SECRET');
