@@ -308,8 +308,6 @@ export const loginUser = async (req: Request, res: Response): Promise<void> => {
   }
 };
 
-
-
 // GET /api/auth/organizations
 export const getOrganizations = async (_req: Request, res: Response): Promise<void> => {
   try {
